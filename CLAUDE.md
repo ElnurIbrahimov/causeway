@@ -44,7 +44,9 @@ causeway/
 
 environments/
   synthetic_scm.py             # Ground-truth SCM (software deployment domain, 8 vars, 10 edges)
-  text_scm.py                  # Text-encoded SCM dataset for training on real Transformer hidden states
+  clinical_scm.py              # Ground-truth SCM (clinical treatment domain, 8 vars, 10 edges)
+  text_scm.py                  # Text-encoded SCM dataset for deployment domain
+  text_clinical.py             # Text-encoded SCM dataset for clinical domain
   self_supervised.py           # Self-supervised dataset: 5 domains, representation shift targets
 
 integration/
@@ -73,20 +75,25 @@ Trains on `SCMDataset` which uses random projections to simulate Transformer hid
 ### Real Transformer hidden states
 
 ```bash
+# Software Deployment domain (default)
 python train_on_transformer.py --model gpt2
 python train_on_transformer.py --model gpt2 --d_causal 48 --epochs 200 --num_samples 50000
 python train_on_transformer.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
 python train_on_transformer.py --model meta-llama/Llama-3.2-1B
+
+# Clinical Treatment domain
+python train_on_transformer.py --domain clinical --model gpt2 --d_causal 48 --epochs 200 --num_samples 50000
 ```
 
-Trains on `TextSCMDataset` which encodes SCM scenarios as natural language, runs them through a frozen Transformer, and trains Causeway on the real hidden state representations. Supports any HuggingFace autoregressive model.
+Trains on `TextSCMDataset` (deployment) or `TextClinicalDataset` (clinical) which encode SCM scenarios as natural language, run them through a frozen Transformer, and train Causeway on the real hidden state representations. Supports any HuggingFace autoregressive model. Use `--domain` to select the SCM domain.
 
-The dataset is cached to disk (`cache_{model}_{samples}_v2.pt`) to avoid re-encoding on subsequent runs.
+The dataset is cached to disk (`cache_{domain}_{model}_{samples}_v2.pt`) to avoid re-encoding on subsequent runs.
 
 ### Key Training Arguments
 
 | Argument | Default | Description |
 |---|---|---|
+| `--domain` | `deployment` | SCM domain: `deployment` or `clinical` |
 | `--model` | `gpt2` | HuggingFace model name |
 | `--d_causal` | 48 | Number of causal variables (graph nodes) |
 | `--d_action` | None | Action dim; defaults to `d_model` (768 for GPT-2) |
@@ -158,6 +165,35 @@ latency_impact   -> user_impact (+0.5)
 resource_usage   -> latency_impact (+0.3)
 ```
 
+## SCM Domain: Clinical Treatment
+
+The clinical SCM models a treatment system with 8 variables:
+
+**Controllable** (actions): `drug_dosage`, `treatment_intensity`, `monitoring_frequency`, `activity_restriction`
+
+**Observable** (effects): `adverse_events`, `recovery_rate`, `organ_stress`, `care_cost`
+
+**Causal graph** (10 ground-truth edges):
+```
+drug_dosage         -> adverse_events    (+0.5)
+drug_dosage         -> recovery_rate     (+0.4)
+drug_dosage         -> organ_stress      (+0.6)
+treatment_intensity -> recovery_rate     (+0.5)
+treatment_intensity -> adverse_events    (+0.3)
+monitoring_freq     -> adverse_events    (-0.4, protective)
+activity_restrict   -> recovery_rate     (-0.3)
+adverse_events      -> organ_stress      (+0.5)
+organ_stress        -> recovery_rate     (-0.4)
+adverse_events      -> care_cost         (+0.6)
+```
+
+**Structured output mapping** (same 5 universal dims):
+- `risk_shift` = adverse_events delta
+- `goal_progress` = recovery_rate delta
+- `constraint_violation` = clip(organ_stress delta * 3, 0, 1)
+- `resource_cost` = care_cost delta
+- `success_probability` = (recovery_rate - adverse_events) / 2
+
 ## Results
 
 ### Synthetic SCM
@@ -178,6 +214,21 @@ resource_usage   -> latency_impact (+0.3)
 | success_probability | 0.9480 | 0.876 | 0.0518 |
 
 Graph converged to 0.7 expected edges at 0.05 temperature.
+
+### GPT-2 — Clinical Treatment Domain
+- **Overall correlation: 0.9420** (same 0.794M params, same hyperparameters)
+- Best val loss: 0.1775 (epoch 197)
+- Overall MAE: 0.0442
+
+| Dimension | Correlation | Dir Acc | MAE |
+|---|---|---|---|
+| risk_shift | 0.9351 | 0.797 | 0.0515 |
+| goal_progress | 0.9329 | 0.853 | 0.0374 |
+| constraint_violation | 0.9309 | 0.480 | 0.0764 |
+| resource_cost | 0.9366 | 0.803 | 0.0281 |
+| success_probability | 0.9238 | 0.859 | 0.0274 |
+
+**Cross-domain result**: Same architecture, same hyperparameters, two completely different domains — both above 0.94. The 5-dim structured output and the causal adapter architecture generalize across domains. One domain is a proof of concept; two domains is infrastructure.
 
 ### V1 -> V2 Improvements
 
@@ -206,8 +257,10 @@ transformers  # for train_on_transformer.py and demo_gpt2.py
 | File | Description |
 |---|---|
 | `causeway_checkpoint.pt` | Synthetic SCM training |
-| `causeway_gpt2.pt` | GPT-2 V2 supervised training (0.9494 corr) |
-| `cache_gpt2_50000_v2.pt` | Cached GPT-2 supervised dataset (50K samples) |
+| `causeway_gpt2.pt` | GPT-2 V2 supervised — deployment domain (0.9494 corr) |
+| `causeway_clinical_gpt2.pt` | GPT-2 V2 supervised — clinical domain (0.9420 corr) |
+| `cache_deployment_gpt2_50000_v2.pt` | Cached GPT-2 deployment dataset (50K samples) |
+| `cache_clinical_gpt2_50000_v2.pt` | Cached GPT-2 clinical dataset (50K samples) |
 | `causeway_ss_gpt2.pt` | Self-supervised Causeway + DeltaDecoder (cos=0.707) |
 | `causeway_ss_gpt2_baseline.pt` | Self-supervised baseline MLP (cos=0.769) |
 | `cache_ss_gpt2_50000.pt` | Cached self-supervised dataset (50K, 461MB) |
