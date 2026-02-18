@@ -230,6 +230,44 @@ Graph converged to 0.7 expected edges at 0.05 temperature.
 
 **Cross-domain result**: Same architecture, same hyperparameters, two completely different domains — both above 0.94. The 5-dim structured output and the causal adapter architecture generalize across domains. One domain is a proof of concept; two domains is infrastructure.
 
+### Mistral 7B v0.3 — Software Deployment Domain
+- **Overall correlation: 0.9641** (17.74M params, 0.24% overhead vs frozen Mistral 7B)
+- Best val loss: 0.1712 (epoch 181)
+- Overall MAE: 0.0476
+
+| Dimension | Correlation | Dir Acc | MAE |
+|---|---|---|---|
+| risk_shift | 0.9608 | 0.807 | 0.0466 |
+| goal_progress | 0.9543 | 0.852 | 0.0534 |
+| constraint_violation | 0.9546 | 0.478 | 0.0697 |
+| resource_cost | 0.9567 | 0.450 | 0.0227 |
+| success_probability | 0.9607 | 0.886 | 0.0455 |
+
+Graph converged to 0.2 expected edges at 0.136 temperature. d_causal=64 (up from 48 on GPT-2) for richer 4096-dim representations.
+
+### Mistral 7B v0.3 — Clinical Treatment Domain
+- **Overall correlation: 0.9555** (same 17.74M params, same hyperparameters)
+- Overall MAE: 0.0373
+
+| Dimension | Correlation | Dir Acc | MAE |
+|---|---|---|---|
+| risk_shift | 0.9535 | 0.816 | 0.0424 |
+| goal_progress | 0.9403 | 0.851 | 0.0362 |
+| constraint_violation | 0.9536 | 0.478 | 0.0582 |
+| resource_cost | 0.9536 | 0.818 | 0.0245 |
+| success_probability | 0.9363 | 0.873 | 0.0250 |
+
+### Scaling: GPT-2 vs Mistral 7B
+
+| | GPT-2 (768-dim) | Mistral 7B (4096-dim) | Improvement |
+|---|---|---|---|
+| Deployment corr | 0.9494 | **0.9641** | +1.5% |
+| Clinical corr | 0.9420 | **0.9555** | +1.4% |
+| Causeway params | 0.794M | 17.74M | 22x (still 0.24% of backbone) |
+| d_causal | 48 | 64 | +33% |
+
+Three backbones (synthetic, GPT-2, Mistral 7B), two domains (deployment, clinical), all above 0.94 correlation. The architecture scales: richer backbone representations produce better counterfactual predictions without changing anything except d_causal.
+
 ### V1 -> V2 Improvements
 
 V1 achieved 0.742 correlation. V2 improvements that reached 0.9494:
@@ -249,7 +287,10 @@ numpy>=1.24.0
 networkx>=3.1
 matplotlib>=3.7.0
 tqdm>=4.65.0
-transformers  # for train_on_transformer.py and demo_gpt2.py
+transformers>=4.36.0
+accelerate>=0.25.0
+sentencepiece>=0.1.99   # for Mistral/LLaMA tokenizers
+protobuf>=4.25.0
 ```
 
 ## Checkpoints
@@ -261,6 +302,8 @@ transformers  # for train_on_transformer.py and demo_gpt2.py
 | `causeway_clinical_gpt2.pt` | GPT-2 V2 supervised — clinical domain (0.9420 corr) |
 | `cache_deployment_gpt2_50000_v2.pt` | Cached GPT-2 deployment dataset (50K samples) |
 | `cache_clinical_gpt2_50000_v2.pt` | Cached GPT-2 clinical dataset (50K samples) |
+| `causeway_Mistral-7B-v0.3.pt` | Mistral 7B supervised — deployment domain (0.9641 corr) |
+| `causeway_clinical_Mistral-7B-v0.3.pt` | Mistral 7B supervised — clinical domain (0.9555 corr) |
 | `causeway_ss_gpt2.pt` | Self-supervised Causeway + DeltaDecoder (cos=0.707) |
 | `causeway_ss_gpt2_baseline.pt` | Self-supervised baseline MLP (cos=0.769) |
 | `cache_ss_gpt2_50000.pt` | Cached self-supervised dataset (50K, 461MB) |
