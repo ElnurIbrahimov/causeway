@@ -89,24 +89,30 @@ def delta_to_text(delta_values):
 # =====================================================================
 
 def load_models(checkpoint_path, device):
-    """Load frozen GPT-2 and trained Causeway."""
-    from transformers import GPT2LMHeadModel, GPT2Model, GPT2Tokenizer
+    """Load frozen Transformer and trained Causeway."""
+    from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
-    print("Loading GPT-2...")
-    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-    tokenizer.pad_token = tokenizer.eos_token
-    gpt2 = GPT2Model.from_pretrained("gpt2").to(device).eval()
-    gpt2_lm = GPT2LMHeadModel.from_pretrained("gpt2").to(device).eval()
-    for p in gpt2.parameters():
-        p.requires_grad = False
-    for p in gpt2_lm.parameters():
-        p.requires_grad = False
-
-    d_model = gpt2.config.n_embd  # 768
-
+    # Load checkpoint first to determine which backbone to use
     print(f"Loading Causeway from {checkpoint_path}...")
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     args = ckpt["args"]
+    d_model = ckpt["d_model"]
+    backbone = ckpt.get("backbone", "gpt2")
+
+    print(f"Loading {backbone}...")
+    tokenizer = AutoTokenizer.from_pretrained(backbone, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Load encoder (hidden states) and LM head (logits for probing)
+    encoder = AutoModel.from_pretrained(backbone, trust_remote_code=True).to(device).eval()
+    lm_model = AutoModelForCausalLM.from_pretrained(backbone, trust_remote_code=True).to(device).eval()
+    for p in encoder.parameters():
+        p.requires_grad = False
+    for p in lm_model.parameters():
+        p.requires_grad = False
+
+    print(f"Backbone: {backbone}, d_model={d_model}")
 
     causeway = Causeway(
         d_model=d_model,
@@ -129,14 +135,14 @@ def load_models(checkpoint_path, device):
     val_corr = ckpt["val_results"]["overall_corr"]
     print(f"Causeway: {n_params / 1e6:.3f}M params, val corr={val_corr:.4f}")
 
-    return tokenizer, gpt2, gpt2_lm, causeway, bridge, d_model
+    return tokenizer, encoder, lm_model, causeway, bridge, d_model
 
 
-def encode_text(text, gpt2, tokenizer, device):
-    """Last-token pooling of GPT-2 hidden states (matches training pipeline)."""
+def encode_text(text, encoder, tokenizer, device):
+    """Last-token pooling of hidden states (matches training pipeline)."""
     inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=128).to(device)
     with torch.no_grad():
-        out = gpt2(**inputs)
+        out = encoder(**inputs)
         seq_len = inputs.attention_mask.sum(dim=1) - 1
         h = out.last_hidden_state[0, seq_len[0]]
     return h.unsqueeze(0)  # (1, 768)
@@ -237,7 +243,7 @@ def generate_scenarios(scm, n, seed):
 # TEST 1: Delta Accuracy
 # =====================================================================
 
-def test_delta_accuracy(scenarios, gpt2, tokenizer, causeway, device):
+def test_delta_accuracy(scenarios, encoder, tokenizer, causeway, device):
     """Sanity check: Causeway's predicted deltas vs SCM ground truth."""
     section("TEST 1: Delta Accuracy (sanity check)")
 
@@ -245,9 +251,9 @@ def test_delta_accuracy(scenarios, gpt2, tokenizer, causeway, device):
     all_gt = []
 
     for sc in tqdm(scenarios, desc="Delta accuracy"):
-        h = encode_text(sc["state_text"], gpt2, tokenizer, device)
+        h = encode_text(sc["state_text"], encoder, tokenizer, device)
         for action_type in ["safe", "risky"]:
-            a = encode_text(sc[f"{action_type}_text"], gpt2, tokenizer, device)
+            a = encode_text(sc[f"{action_type}_text"], encoder, tokenizer, device)
             gt = sc[f"{action_type}_delta_gt"]
             with torch.no_grad():
                 pred = causeway(h, a).values[0].cpu().numpy()
@@ -276,7 +282,7 @@ def test_delta_accuracy(scenarios, gpt2, tokenizer, causeway, device):
 # TEST 2: Action Ranking
 # =====================================================================
 
-def test_action_ranking(scenarios, gpt2, tokenizer, causeway, device):
+def test_action_ranking(scenarios, encoder, tokenizer, causeway, device):
     """Can Causeway correctly rank safe actions above risky ones?"""
     section("TEST 2: Action Ranking (Causeway standalone)")
 
@@ -285,9 +291,9 @@ def test_action_ranking(scenarios, gpt2, tokenizer, causeway, device):
     quality_gaps_pred = []
 
     for sc in tqdm(scenarios, desc="Action ranking"):
-        h = encode_text(sc["state_text"], gpt2, tokenizer, device)
-        a_safe = encode_text(sc["safe_text"], gpt2, tokenizer, device)
-        a_risky = encode_text(sc["risky_text"], gpt2, tokenizer, device)
+        h = encode_text(sc["state_text"], encoder, tokenizer, device)
+        a_safe = encode_text(sc["safe_text"], encoder, tokenizer, device)
+        a_risky = encode_text(sc["risky_text"], encoder, tokenizer, device)
 
         with torch.no_grad():
             delta_safe = causeway(h, a_safe).values[0].cpu().numpy()
@@ -317,7 +323,7 @@ def test_action_ranking(scenarios, gpt2, tokenizer, causeway, device):
 # TEST 3: Risk Probe
 # =====================================================================
 
-def test_risk_probe(scenarios, gpt2, gpt2_lm, tokenizer, causeway, device):
+def test_risk_probe(scenarios, encoder, lm_model, tokenizer, causeway, device):
     """Does injecting Causeway's delta as text shift GPT-2's risk assessment?"""
     section("TEST 3: Risk Probe (text injection)")
 
@@ -341,7 +347,7 @@ def test_risk_probe(scenarios, gpt2, gpt2_lm, tokenizer, causeway, device):
     gt_risks = []
 
     for sc in tqdm(scenarios, desc="Risk probe"):
-        h = encode_text(sc["state_text"], gpt2, tokenizer, device)
+        h = encode_text(sc["state_text"], encoder, tokenizer, device)
 
         for action_type in ["safe", "risky"]:
             action_text = sc[f"{action_type}_text"]
@@ -349,7 +355,7 @@ def test_risk_probe(scenarios, gpt2, gpt2_lm, tokenizer, causeway, device):
             gt_risk = gt_delta[0]  # risk_shift dimension
 
             # Get Causeway's predicted delta
-            a = encode_text(action_text, gpt2, tokenizer, device)
+            a = encode_text(action_text, encoder, tokenizer, device)
             with torch.no_grad():
                 pred_delta = causeway(h, a).values[0].cpu().numpy()
 
@@ -368,7 +374,7 @@ def test_risk_probe(scenarios, gpt2, gpt2_lm, tokenizer, causeway, device):
                 base_prompt, return_tensors="pt", truncation=True, max_length=200
             ).to(device)
             with torch.no_grad():
-                logits_base = gpt2_lm(**inputs_base).logits[0, -1, :]
+                logits_base = lm_model(**inputs_base).logits[0, -1, :]
             probs_base = F.softmax(logits_base, dim=-1)
             p_risk = probs_base[risk_ids].sum().item()
             p_safe = probs_base[safe_ids].sum().item()
@@ -379,7 +385,7 @@ def test_risk_probe(scenarios, gpt2, gpt2_lm, tokenizer, causeway, device):
                 aug_prompt, return_tensors="pt", truncation=True, max_length=300
             ).to(device)
             with torch.no_grad():
-                logits_aug = gpt2_lm(**inputs_aug).logits[0, -1, :]
+                logits_aug = lm_model(**inputs_aug).logits[0, -1, :]
             probs_aug = F.softmax(logits_aug, dim=-1)
             p_risk = probs_aug[risk_ids].sum().item()
             p_safe = probs_aug[safe_ids].sum().item()
@@ -414,7 +420,7 @@ def test_risk_probe(scenarios, gpt2, gpt2_lm, tokenizer, causeway, device):
 # TEST 4: Pairwise Selection
 # =====================================================================
 
-def test_pairwise_selection(scenarios, gpt2, gpt2_lm, tokenizer, causeway, bridge, device):
+def test_pairwise_selection(scenarios, encoder, lm_model, tokenizer, causeway, bridge, device):
     """Given two actions, does GPT-2 pick the safer one with Causeway's help?"""
     section("TEST 4: Pairwise Selection")
 
@@ -437,9 +443,9 @@ def test_pairwise_selection(scenarios, gpt2, gpt2_lm, tokenizer, causeway, bridg
             correct_token = token_B
 
         # Encode for Causeway
-        h = encode_text(sc["state_text"], gpt2, tokenizer, device)
-        a_a = encode_text(opt_a_text, gpt2, tokenizer, device)
-        a_b = encode_text(opt_b_text, gpt2, tokenizer, device)
+        h = encode_text(sc["state_text"], encoder, tokenizer, device)
+        a_a = encode_text(opt_a_text, encoder, tokenizer, device)
+        a_b = encode_text(opt_b_text, encoder, tokenizer, device)
 
         with torch.no_grad():
             delta_a = causeway(h, a_a).values[0].cpu().numpy()
@@ -470,7 +476,7 @@ def test_pairwise_selection(scenarios, gpt2, gpt2_lm, tokenizer, causeway, bridg
             base_prompt, return_tensors="pt", truncation=True, max_length=300
         ).to(device)
         with torch.no_grad():
-            logits = gpt2_lm(**inputs).logits[0, -1, :]
+            logits = lm_model(**inputs).logits[0, -1, :]
         choice = token_A if logits[token_A] > logits[token_B] else token_B
         if choice == correct_token:
             baseline_correct += 1
@@ -480,7 +486,7 @@ def test_pairwise_selection(scenarios, gpt2, gpt2_lm, tokenizer, causeway, bridg
             aug_prompt, return_tensors="pt", truncation=True, max_length=400
         ).to(device)
         with torch.no_grad():
-            logits_aug = gpt2_lm(**inputs_aug).logits[0, -1, :]
+            logits_aug = lm_model(**inputs_aug).logits[0, -1, :]
         choice = token_A if logits_aug[token_A] > logits_aug[token_B] else token_B
         if choice == correct_token:
             text_correct += 1
@@ -492,13 +498,17 @@ def test_pairwise_selection(scenarios, gpt2, gpt2_lm, tokenizer, causeway, bridg
         best_action_repr = a_a if q_a > q_b else a_b
         prefix = bridge.get_causal_prefix(h, best_action_repr)
 
-        input_embeds = gpt2_lm.transformer.wte(inputs.input_ids)
+        # Get input embeddings (works for both GPT-2 and Mistral/Llama)
+        if hasattr(lm_model, 'transformer'):
+            input_embeds = lm_model.transformer.wte(inputs.input_ids)
+        else:
+            input_embeds = lm_model.model.embed_tokens(inputs.input_ids)
         augmented_embeds = torch.cat([prefix, input_embeds], dim=1)
         aug_mask = torch.ones(1, augmented_embeds.shape[1], device=device)
         pos_ids = torch.arange(augmented_embeds.shape[1], device=device).unsqueeze(0)
 
         with torch.no_grad():
-            logits_prefix = gpt2_lm(
+            logits_prefix = lm_model(
                 inputs_embeds=augmented_embeds,
                 attention_mask=aug_mask,
                 position_ids=pos_ids,
@@ -540,7 +550,7 @@ def main():
     print(f"Device: {device}")
 
     # Load models
-    tokenizer, gpt2, gpt2_lm, causeway, bridge, d_model = load_models(
+    tokenizer, encoder, lm_model, causeway, bridge, d_model = load_models(
         args.checkpoint, device
     )
 
@@ -551,19 +561,19 @@ def main():
 
     # Run tests
     all_pred, all_gt, delta_corr = test_delta_accuracy(
-        scenarios, gpt2, tokenizer, causeway, device
+        scenarios, encoder, tokenizer, causeway, device
     )
 
     rank_acc, gap_corr = test_action_ranking(
-        scenarios, gpt2, tokenizer, causeway, device
+        scenarios, encoder, tokenizer, causeway, device
     )
 
     base_risk_corr, aug_risk_corr, base_risk_acc, aug_risk_acc = test_risk_probe(
-        scenarios, gpt2, gpt2_lm, tokenizer, causeway, device
+        scenarios, encoder, lm_model, tokenizer, causeway, device
     )
 
     base_sel, text_sel, prefix_sel = test_pairwise_selection(
-        scenarios, gpt2, gpt2_lm, tokenizer, causeway, bridge, device
+        scenarios, encoder, lm_model, tokenizer, causeway, bridge, device
     )
 
     # Summary
