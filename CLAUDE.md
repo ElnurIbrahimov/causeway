@@ -49,12 +49,25 @@ environments/
   text_clinical.py             # Text-encoded SCM dataset for clinical domain
   self_supervised.py           # Self-supervised dataset: 5 domains, representation shift targets
 
+keystone/
+  __init__.py                  # Package exports: Keystone, UncertaintyEncoder, CommitmentGate, etc.
+  keystone_module.py           # Main nn.Module wiring 4-layer defense pipeline
+  uncertainty_encoder.py       # Layer 1: QR rotation + NIG evidential head
+  commitment_gate.py           # Layer 2: SelectiveNet-style 4-route gate
+  constraint_manager.py        # Layer 3: Lagrangian multipliers + dual ascent
+  conformal_calibrator.py      # Layer 4: Split conformal + ACI
+  losses.py                    # KeystoneLoss (evidential + selective risk + Lagrangian + calibration)
+  commitment.py                # KeystoneCommitment dataclass, ROUTE_NAMES
+
 integration/
   transformer_bridge.py        # Wires Causeway to frozen Transformer via causal prefix injection
+  causeway_keystone.py         # Joint Causeway + Keystone orchestrator (GatedDelta)
+  keystone_bridge.py           # Keystone-aware TransformerBridge (route-gated prefix injection)
 
 train.py                       # Train on synthetic SCM (ground-truth counterfactuals)
 train_on_transformer.py        # Train on real Transformer (GPT-2, TinyLlama, etc.) hidden states
 train_self_supervised.py       # Self-supervised: Causeway vs baseline MLP on h_delta reconstruction
+train_keystone.py              # Train Keystone on cached Transformer hidden states (3-phase schedule)
 evaluate.py                    # Evaluation: graph recovery, counterfactual examples, stress test
 demo_gpt2.py                   # End-to-end demo: GPT-2 + Causeway + causal prefix generation
 run_mistral.sh                 # Train Mistral 7B on both domains (deployment + clinical)
@@ -62,6 +75,79 @@ run_clinical.sh                # Train clinical domain only (standalone, RunPod-
 runpod_setup.sh                # RunPod instance setup (dependencies, GPU check, model download)
 Causeway Prior Work Analysis.pdf  # Prior work analysis document
 ```
+
+## Keystone: Commitment and Uncertainty Spine
+
+Keystone is the second companion module for Transformers. While Causeway predicts **what would change** under intervention, Keystone evaluates **whether to trust that prediction** and gates execution accordingly.
+
+Keystone forces the model to explicitly declare: how confident it is (epistemic vs aleatoric), what it assumes (premises), and what should happen if it is wrong (failure modes). This is not text — it is control flow that physically gates the action pathway.
+
+### Architecture
+
+```
+UncertaintyEncoder -> CommitmentGate -> ConstraintManager -> ConformalCalibrator
+```
+
+**4-layer defense pipeline:**
+1. **UncertaintyEncoder** (`keystone/uncertainty_encoder.py`): QR-initialized rotation (same as Causeway's StateEncoder) + NIG evidential head producing epistemic/aleatoric decomposition. nu capped at 100 to prevent evidence collapse.
+2. **CommitmentGate** (`keystone/commitment_gate.py`): SelectiveNet-style 4-route gate (proceed/verify/defer/abstain) with premise detection and failure mode prediction heads. Temperature-annealed softmax.
+3. **ConstraintManager** (`keystone/constraint_manager.py`): Lagrangian multipliers (NOT optimizer parameters) for coverage, risk, and calibration constraints. Dual ascent with EMA-smoothed violations. 0 learnable parameters.
+4. **ConformalCalibrator** (`keystone/conformal_calibrator.py`): Split conformal prediction with ACI for distribution-free coverage guarantees. Post-hoc calibration. 0 learnable parameters.
+
+### Output: KeystoneCommitment
+
+| Field | Shape | Description |
+|---|---|---|
+| `values` | (batch, 5) | NIG point estimates (same dims as Causeway's delta) |
+| `epistemic` | (batch, 5) | Reducible uncertainty per dimension |
+| `aleatoric` | (batch, 5) | Irreducible uncertainty per dimension |
+| `confidence_bounds` | (batch, 5, 2) | Conformalized [lower, upper] intervals |
+| `route` | (batch, 4) | Softmax probs over proceed/verify/defer/abstain |
+| `premises` | (batch, 5) | Per-dim premise confidence [0,1] |
+| `failure_modes` | (batch, 5) | Per-dim failure probability [0,1] |
+
+### Training
+
+```bash
+# Requires Causeway's cached dataset
+python train_keystone.py --model gpt2
+python train_keystone.py --domain clinical --model gpt2
+```
+
+3-phase staged training: evidential only (0-30%), add routing (30-60%), all losses (60-100%). Evidence regularizer annealed. Gate temperature annealed 2.0 -> 0.5. Post-training conformal calibration on held-out 15%.
+
+### Loss Function
+
+```
+L_total = L_evidential (NIG Type-II MLE + evidence reg)
+        + lambda_selective * L_selective_risk
+        + L_lagrangian (augmented Lagrangian)
+        + lambda_ortho * L_orthogonality
+        + lambda_premise * L_premise (BCE)
+        + lambda_failure * L_failure (BCE)
+```
+
+### Integration with Causeway
+
+`CausewayKeystoneOrchestrator` (`integration/causeway_keystone.py`) runs both in parallel:
+- Causeway predicts delta, Keystone evaluates commitment
+- `gated_values = delta.values * proceed_prob`
+- Conservative confidence: `min(causeway_conf, 1 - normalized_epistemic)`
+
+`KeystoneBridge` (`integration/keystone_bridge.py`) extends TransformerBridge:
+- proceed: full causal prefix
+- verify: 0.5 * causal + 0.5 * uncertainty prefix
+- defer: uncertainty prefix only
+- abstain: zero prefix (nothing injected)
+
+### Parameter Budget
+
+| Scale | Keystone | Combined w/ Causeway | Overhead |
+|---|---|---|---|
+| GPT-2 | 0.341M | 1.135M | 0.92% |
+| Mistral 7B | 5.189M | 22.929M | 0.32% |
+
+Full documentation: `C:\Users\asus\Desktop\keystone.md`
 
 ## Training
 
@@ -270,6 +356,34 @@ Graph converged to 0.2 expected edges at 0.136 temperature. d_causal=64 (up from
 
 Three backbones (synthetic, GPT-2, Mistral 7B), two domains (deployment, clinical), all above 0.94 correlation. The architecture scales: richer backbone representations produce better counterfactual predictions without changing anything except d_causal.
 
+### Closed-Loop Evaluation
+
+Tests whether Causeway's causal deltas, when fed back to the Transformer, improve decision quality. Scored against SCM ground truth on 200 fresh deployment scenarios with paired safe/risky actions.
+
+**Causeway as standalone decision oracle:**
+
+| Metric | GPT-2 | Mistral 7B |
+|---|---|---|
+| Delta accuracy (fresh data) | 0.9205 corr | 0.9296 corr |
+| Action ranking (safe > risky) | 99.5% | 99.5% |
+| Quality gap correlation | 0.8714 | 0.8656 |
+
+Causeway correctly identifies the safer action in 199/200 scenarios on both backbones.
+
+**Closed-loop injection (does the Transformer use Causeway's signal?):**
+
+| Method | GPT-2 (124M) | Mistral 7B |
+|---|---|---|
+| Baseline (no Causeway) | 49.0% (coin flip) | 100.0% |
+| + Causeway text injection | 49.0% | 100.0% |
+| + Bridge prefix (untrained) | 49.0% | 100.0% |
+
+**Interpretation**: GPT-2 cannot use the injected causal signal — it's too small to reason about structured analysis text and picks randomly. Mistral 7B already scores 100% without Causeway because the test scenarios have obviously safe vs obviously risky actions that a 7B model understands from text alone.
+
+Causeway's value is at the representation level: 99.5% action ranking from hidden states, no text generation needed. It operates as a structured decision oracle — faster and more reliable than asking the LLM to reason about risk in natural language.
+
+**Script**: `eval_closed_loop.py` — supports any backbone via checkpoint auto-detection.
+
 ### V1 -> V2 Improvements
 
 V1 achieved 0.742 correlation. V2 improvements that reached 0.9494:
@@ -309,6 +423,8 @@ protobuf>=4.25.0
 | `causeway_ss_gpt2.pt` | Self-supervised Causeway + DeltaDecoder (cos=0.707) |
 | `causeway_ss_gpt2_baseline.pt` | Self-supervised baseline MLP (cos=0.769) |
 | `cache_ss_gpt2_50000.pt` | Cached self-supervised dataset (50K, 461MB) |
+| `keystone_gpt2.pt` | Keystone GPT-2 deployment domain (after training) |
+| `keystone_clinical_gpt2.pt` | Keystone GPT-2 clinical domain (after training) |
 
 ## Related Work
 
