@@ -174,14 +174,14 @@ class TextSCMDataset(Dataset):
         if cache_path and os.path.exists(cache_path):
             print(f"Loading cached dataset from {cache_path}")
             data = torch.load(cache_path, weights_only=False)
-            self.h = data["h"]
-            self.actions = data["actions"]
+            self.h = data["h"].float()
+            self.actions = data["actions"].float()
             self.targets = data["targets"]
             self.d_model = data["d_model"]
             self.texts_scenario = data["texts_scenario"]
             self.texts_action = data["texts_action"]
             self.intervention_masks = data["intervention_masks"]
-            print(f"Loaded {len(self.h)} samples, d_model={self.d_model}")
+            print(f"Loaded {len(self.h)} samples, d_model={self.d_model}, dtype={self.h.dtype}")
             return
 
         # Generate SCM data

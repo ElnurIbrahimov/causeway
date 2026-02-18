@@ -100,6 +100,9 @@ class StateEncoder(nn.Module):
             z: Causal variables, shape (batch, d_causal)
                or (batch, seq_len, d_causal).
         """
+        # Ensure fp32 (Mistral/LLaMA output fp16 hidden states)
+        h = h.float()
+
         # Linear rotation into causal subspace
         z = h @ self.rotation  # (..., d_causal)
 

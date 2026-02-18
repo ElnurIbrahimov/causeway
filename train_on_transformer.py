@@ -167,6 +167,7 @@ def main():
 
     print(f"\nDataset: {n_train} train, {n_val} val")
     print(f"Backbone d_model: {d_model}")
+    print(f"h dtype: {dataset.h.dtype}, action dtype: {dataset.actions.dtype}")
 
     # ---- Model ----
     model = Causeway(
