@@ -145,7 +145,7 @@ def encode_text(text, encoder, tokenizer, device):
         out = encoder(**inputs)
         seq_len = inputs.attention_mask.sum(dim=1) - 1
         h = out.last_hidden_state[0, seq_len[0]]
-    return h.unsqueeze(0)  # (1, 768)
+    return h.unsqueeze(0).float()  # (1, d_model), ensure fp32
 
 
 # =====================================================================
