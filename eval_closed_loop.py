@@ -503,6 +503,8 @@ def test_pairwise_selection(scenarios, encoder, lm_model, tokenizer, causeway, b
             input_embeds = lm_model.transformer.wte(inputs.input_ids)
         else:
             input_embeds = lm_model.model.embed_tokens(inputs.input_ids)
+        # Match dtypes (bridge outputs fp32, Mistral expects fp16)
+        prefix = prefix.to(input_embeds.dtype)
         augmented_embeds = torch.cat([prefix, input_embeds], dim=1)
         aug_mask = torch.ones(1, augmented_embeds.shape[1], device=device)
         pos_ids = torch.arange(augmented_embeds.shape[1], device=device).unsqueeze(0)
