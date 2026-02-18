@@ -286,8 +286,8 @@ class TextSCMDataset(Dataset):
         del transformer
         torch.cuda.empty_cache()
 
-        self.h = torch.cat(all_h, dim=0)       # (N, d_model)
-        self.actions = torch.cat(all_a, dim=0)  # (N, d_model) — full representation
+        self.h = torch.cat(all_h, dim=0).float()       # (N, d_model) — ensure fp32
+        self.actions = torch.cat(all_a, dim=0).float()  # (N, d_model) — ensure fp32
 
         self.targets = torch.tensor(structured_deltas, dtype=torch.float32)
         self.texts_scenario = texts_scenario

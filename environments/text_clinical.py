@@ -265,8 +265,8 @@ class TextClinicalDataset(Dataset):
         del transformer
         torch.cuda.empty_cache()
 
-        self.h = torch.cat(all_h, dim=0)
-        self.actions = torch.cat(all_a, dim=0)
+        self.h = torch.cat(all_h, dim=0).float()       # ensure fp32 (Mistral outputs fp16)
+        self.actions = torch.cat(all_a, dim=0).float()  # ensure fp32
 
         self.targets = torch.tensor(structured_deltas, dtype=torch.float32)
         self.texts_scenario = texts_scenario
