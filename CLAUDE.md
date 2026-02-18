@@ -57,8 +57,10 @@ train_on_transformer.py        # Train on real Transformer (GPT-2, TinyLlama, et
 train_self_supervised.py       # Self-supervised: Causeway vs baseline MLP on h_delta reconstruction
 evaluate.py                    # Evaluation: graph recovery, counterfactual examples, stress test
 demo_gpt2.py                   # End-to-end demo: GPT-2 + Causeway + causal prefix generation
-run_mistral.sh                 # Training script for Mistral 7B v0.3 on RunPod
+run_mistral.sh                 # Train Mistral 7B on both domains (deployment + clinical)
+run_clinical.sh                # Train clinical domain only (standalone, RunPod-friendly)
 runpod_setup.sh                # RunPod instance setup (dependencies, GPU check, model download)
+Causeway Prior Work Analysis.pdf  # Prior work analysis document
 ```
 
 ## Training
@@ -342,10 +344,10 @@ No existing system combines all of Causeway's properties into a single module. T
 | Pearl's do-operator | Yes | No | Partial | Partial | No | **Yes** |
 | Learned sparse DAG | No | No | Yes | No | No | **Yes** |
 | Structured delta output | No | No | Text | No | No | **Yes** |
-| Parameter-efficient (<1M) | No | N/A | No | No | No | **Yes (0.794M)** |
+| Parameter-efficient | No | N/A | No | No | No | **Yes (0.794M GPT-2, 17.74M Mistral)** |
 | Plugs into any Transformer | No | No | No | No | Diffusion only | **Yes** |
 
-The unique contribution is the combination: a sub-1M parameter module implementing full Pearl counterfactual inference through a learned sparse DAG, operating on real Transformer hidden states, producing structured non-text outputs, without touching the backbone weights.
+The unique contribution is the combination: a parameter-efficient module (0.794M for GPT-2, 17.74M for Mistral 7B — always <0.25% of backbone) implementing full Pearl counterfactual inference through a learned sparse DAG, operating on real Transformer hidden states, producing structured non-text outputs, without touching the backbone weights.
 
 ### Self-Supervised Training (Representation Shift Reconstruction)
 
@@ -427,6 +429,26 @@ The integration module (`integration/broadmind_bridge.py`) contains three compon
 Combined system: 1.3M params (794K Causeway + 447K BroadMind + 60K bridge).
 
 See [BroadMindxCauseway](https://github.com/ElnurIbrahimov/BroadMindxCauseway) for the full integration documentation.
+
+## Environment Requirements
+
+- **Python**: 3.10+
+- **CUDA**: Required for Transformer encoding. Training Causeway itself runs on CPU or GPU.
+- **VRAM for encoding**: GPT-2 ~2 GB, Mistral 7B fp16 ~16-18 GB (freed after encoding)
+- **VRAM for training**: ~1 GB (Causeway only, backbone is freed after dataset caching)
+- **Recommended GPU for Mistral**: 24+ GB (RTX 4090, A10, A100)
+
+## Gotchas
+
+- **fp16 dtype mismatch**: Large models (Mistral, LLaMA) load in fp16, producing fp16 hidden states. Causeway parameters are fp32. The datasets cast to `.float()` on encoding and cache loading, and `StateEncoder.forward` has a safety `h.float()` cast — but if you build custom pipelines, ensure inputs are fp32.
+- **RunPod terminal disconnects**: The RunPod web terminal drops websocket connections frequently. Always use `nohup` for training runs:
+  ```bash
+  nohup ./run_clinical.sh > out.log 2>&1 &
+  tail -20 out.log  # check progress
+  ```
+- **Python output buffering**: When redirecting to a log file, Python buffers stdout. Use `python -u` (unbuffered) or the provided shell scripts which include `-u`.
+- **Cached datasets**: Encoded datasets are cached to `cache_{domain}_{model}_{samples}_v2.pt`. Delete the cache if you change the encoding logic (pooling strategy, text templates, etc.) — stale caches silently produce wrong results.
+- **`--d_causal` scaling**: Use 48 for GPT-2 (768-dim), 64 for Mistral 7B (4096-dim). The graph has `d_causal^2` potential edges, so doubling d_causal quadruples the graph search space.
 
 ## Key Design Decisions
 
