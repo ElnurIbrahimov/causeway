@@ -43,6 +43,8 @@ def parse_args():
                    help="Path to trained bridge checkpoint (enables trained bridge eval)")
     p.add_argument("--bridge_version", type=str, default="v2",
                    choices=["v1", "v2"])
+    p.add_argument("--surgical_checkpoint", type=str, default=None,
+                   help="Path to surgical CausewayLayer checkpoint (enables surgical eval)")
     p.add_argument("--n_scenarios", type=int, default=200,
                    help="Number of test scenarios to generate")
     p.add_argument("--seed", type=int, default=777)
@@ -557,7 +559,8 @@ def test_risk_probe(scenarios, encoder, lm_model, tokenizer, causeway, device):
 
 def test_pairwise_selection(scenarios, encoder, lm_model, tokenizer, causeway,
                             bridge, device, domain="deployment",
-                            bridge_trained=None):
+                            bridge_trained=None,
+                            surgical_model=None, surgical_tokenizer=None):
     """Given two actions, does the Transformer pick the safer one with Causeway's help?"""
     section("TEST 4: Pairwise Selection")
 
@@ -577,6 +580,7 @@ def test_pairwise_selection(scenarios, encoder, lm_model, tokenizer, causeway,
     text_correct = 0
     prefix_correct = 0
     trained_prefix_correct = 0
+    surgical_correct = 0
     total = 0
 
     for sc in tqdm(scenarios, desc="Pairwise selection"):
@@ -682,6 +686,25 @@ def test_pairwise_selection(scenarios, encoder, lm_model, tokenizer, causeway,
             if choice == correct_token:
                 trained_prefix_correct += 1
 
+        # === Surgical: CausewayLayer in the model's forward pass ===
+        if surgical_model is not None:
+            surg_tok = surgical_tokenizer or tokenizer
+            surg_inputs = surg_tok(
+                base_prompt, return_tensors="pt", truncation=True, max_length=300
+            ).to(device)
+            with torch.no_grad():
+                surg_logits = surgical_model(**surg_inputs).logits[0, -1, :]
+            surg_token_A = surg_tok.encode(" A")[0]
+            surg_token_B = surg_tok.encode(" B")[0]
+            # Map correct_token to surgical tokenizer's tokens
+            if correct_token == token_A:
+                surg_correct = surg_token_A
+            else:
+                surg_correct = surg_token_B
+            choice = surg_token_A if surg_logits[surg_token_A] > surg_logits[surg_token_B] else surg_token_B
+            if choice == surg_correct:
+                surgical_correct += 1
+
         total += 1
 
     base_acc = baseline_correct / total
@@ -699,13 +722,20 @@ def test_pairwise_selection(scenarios, encoder, lm_model, tokenizer, causeway,
         trained_prefix_acc = trained_prefix_correct / total
         print(f"  {'+ Bridge prefix (trained)':<32} {trained_prefix_acc*100:>19.1f}%")
 
+    surgical_acc = None
+    if surgical_model is not None:
+        surgical_acc = surgical_correct / total
+        print(f"  {'+ Surgical CausewayLayer':<32} {surgical_acc*100:>19.1f}%")
+
     print(f"  {'-'*54}")
     print(f"  {'Text lift vs baseline':<32} {(text_acc - base_acc)*100:>+19.1f}%")
     print(f"  {'Prefix lift vs baseline':<32} {(prefix_acc - base_acc)*100:>+19.1f}%")
     if trained_prefix_acc is not None:
         print(f"  {'Trained prefix lift':<32} {(trained_prefix_acc - base_acc)*100:>+19.1f}%")
+    if surgical_acc is not None:
+        print(f"  {'Surgical lift vs baseline':<32} {(surgical_acc - base_acc)*100:>+19.1f}%")
 
-    return base_acc, text_acc, prefix_acc, trained_prefix_acc
+    return base_acc, text_acc, prefix_acc, trained_prefix_acc, surgical_acc
 
 
 # =====================================================================
@@ -747,6 +777,53 @@ def main():
         bridge_version=args.bridge_version,
     )
 
+    # Optionally load surgical model
+    surgical_model = None
+    surgical_tokenizer = None
+    if args.surgical_checkpoint is not None:
+        from integration.surgical_insertion import insert_causeway_layer, detect_architecture
+        from integration.causeway_layer import CausewayLayer
+
+        print(f"\nLoading surgical CausewayLayer from {args.surgical_checkpoint}...")
+        surg_ckpt = torch.load(args.surgical_checkpoint, map_location=device, weights_only=False)
+        surg_d_model = surg_ckpt['d_model']
+        surg_d_causal = surg_ckpt['d_causal']
+        surg_d_action = surg_ckpt['d_action']
+        surg_cw_args = surg_ckpt['oracle_args']
+        surg_layer_idx = surg_ckpt['layer_idx']
+
+        # Load a separate copy of the LM for surgical eval
+        from transformers import AutoModelForCausalLM, AutoTokenizer as AT
+        surg_backbone = surg_ckpt.get('model', 'gpt2')
+        print(f"Loading surgical backbone: {surg_backbone}...")
+        surgical_tokenizer = AT.from_pretrained(surg_backbone, trust_remote_code=True)
+        if surgical_tokenizer.pad_token is None:
+            surgical_tokenizer.pad_token = surgical_tokenizer.eos_token
+        surgical_model = AutoModelForCausalLM.from_pretrained(
+            surg_backbone, trust_remote_code=True).to(device).eval()
+        for p in surgical_model.parameters():
+            p.requires_grad = False
+
+        # Create and insert CausewayLayer
+        surg_causeway = Causeway(
+            d_model=surg_d_model, d_causal=surg_d_causal, d_action=surg_d_action,
+            graph_layers=surg_cw_args.get("graph_layers", 2),
+            propagation_steps=surg_cw_args.get("propagation_steps", 3),
+        ).to(device)
+
+        surg_arch = detect_architecture(surgical_model)
+        surg_cl = insert_causeway_layer(
+            surgical_model, surg_causeway, layer_idx=surg_layer_idx,
+            architecture=surg_arch,
+            d_pool=surg_ckpt.get('d_pool'),
+            bottleneck_dim=surg_ckpt.get('bottleneck_dim', 256),
+            gate_init=surg_ckpt.get('gate_init', -5.0),
+            device=device,
+        )
+        surg_cl.load_state_dict(surg_ckpt['causeway_layer_state_dict'])
+        surgical_model.eval()
+        print(f"Surgical model loaded. Gate={surg_cl.gate.item():.4f}")
+
     # Generate test scenarios
     print(f"\nGenerating {args.n_scenarios} test scenarios (domain={args.domain})...")
     scm = SCMClass(noise_scale=0.05, seed=42)
@@ -772,10 +849,12 @@ def main():
         scenarios, encoder, lm_model, tokenizer, causeway, device
     )
 
-    base_sel, text_sel, prefix_sel, trained_sel = test_pairwise_selection(
+    base_sel, text_sel, prefix_sel, trained_sel, surgical_sel = test_pairwise_selection(
         scenarios, encoder, lm_model, tokenizer, causeway, bridge, device,
         domain=args.domain,
         bridge_trained=bridge_trained,
+        surgical_model=surgical_model,
+        surgical_tokenizer=surgical_tokenizer,
     )
 
     # Summary
@@ -799,6 +878,9 @@ def main():
     if trained_sel is not None:
         print(f"    + Bridge prefix (trained): {trained_sel*100:.1f}% ({(trained_sel - base_sel)*100:+.1f}%)")
 
+    if surgical_sel is not None:
+        print(f"    + Surgical CausewayLayer:  {surgical_sel*100:.1f}% ({(surgical_sel - base_sel)*100:+.1f}%)")
+
     print()
 
     # Interpretation
@@ -820,6 +902,15 @@ def main():
         print("  >>> Trained bridge improves over untrained — bridge training is effective.")
     elif trained_sel is not None and trained_sel > base_sel + 0.05:
         print("  >>> Trained bridge beats baseline — causal steering works.")
+
+    if surgical_sel is not None:
+        if surgical_sel > base_sel + 0.15:
+            print("  >>> SURGICAL SUCCESS: CausewayLayer achieves >15pp lift over baseline.")
+            print("  >>> The model cannot ignore causal information when it's in the forward pass.")
+        elif surgical_sel > base_sel + 0.05:
+            print("  >>> Surgical CausewayLayer shows meaningful improvement over baseline.")
+        else:
+            print("  >>> Surgical CausewayLayer shows limited improvement — may need more training.")
 
     print(f"\n{'='*70}")
 
