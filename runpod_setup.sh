@@ -36,9 +36,9 @@ if torch.cuda.is_available():
         print('VRAM OK for Mistral 7B fp16 encoding.')
 "
 
-# 3. Download model (pre-download so encoding doesn't stall)
+# 3a. Download model (pre-download so encoding doesn't stall)
 echo ""
-echo "[3/4] Pre-downloading Mistral 7B v0.3 (this may take a few minutes)..."
+echo "[3a/4] Pre-downloading Mistral 7B v0.3 (this may take a few minutes)..."
 python -c "
 from transformers import AutoModel, AutoTokenizer
 print('Downloading tokenizer...')
@@ -46,6 +46,18 @@ AutoTokenizer.from_pretrained('mistralai/Mistral-7B-v0.3', trust_remote_code=Tru
 print('Downloading model...')
 AutoModel.from_pretrained('mistralai/Mistral-7B-v0.3', trust_remote_code=True, torch_dtype='auto')
 print('Model cached successfully.')
+"
+
+# 3b. Pre-download Llama 3.1 8B
+echo ""
+echo "[3b/4] Pre-downloading Llama 3.1 8B..."
+python -c "
+from transformers import AutoModel, AutoTokenizer
+print('Downloading Llama 3.1 8B tokenizer...')
+AutoTokenizer.from_pretrained('meta-llama/Llama-3.1-8B', trust_remote_code=True)
+print('Downloading Llama 3.1 8B model...')
+AutoModel.from_pretrained('meta-llama/Llama-3.1-8B', trust_remote_code=True, torch_dtype='auto')
+print('Llama 3.1 8B cached successfully.')
 "
 
 # 4. Verify project files
@@ -60,11 +72,13 @@ from environments.text_scm import TextSCMDataset
 print('  TextSCMDataset (deployment) .. OK')
 from environments.text_clinical import TextClinicalDataset
 print('  TextClinicalDataset (clinical) OK')
+from environments.text_confounded import TextConfoundedDataset
+print('  TextConfoundedDataset (confounded) OK')
 
 # Quick param count for Mistral config
 model = Causeway(d_model=4096, d_causal=64, d_action=4096)
 n = sum(p.numel() for p in model.parameters())
-print(f'  Causeway params (Mistral): {n/1e6:.2f}M')
+print(f'  Causeway params (Mistral/Llama): {n/1e6:.2f}M')
 print('All checks passed!')
 "
 
@@ -74,18 +88,28 @@ echo "  Setup complete! Start training with:"
 echo ""
 echo "    chmod +x run_mistral.sh && ./run_mistral.sh"
 echo ""
+echo "  Or run the confounded pipeline on Llama 3.1 8B:"
+echo ""
+echo "    chmod +x run_confounded.sh && ./run_confounded.sh"
+echo ""
 echo "  Or run domains individually:"
 echo ""
-echo "    # Deployment only"
+echo "    # Deployment only (Mistral)"
 echo "    python train_on_transformer.py \\"
 echo "      --domain deployment \\"
 echo "      --model mistralai/Mistral-7B-v0.3 \\"
 echo "      --d_causal 64 --epochs 200 --num_samples 50000"
 echo ""
-echo "    # Clinical only"
+echo "    # Clinical only (Mistral)"
 echo "    python train_on_transformer.py \\"
 echo "      --domain clinical \\"
 echo "      --model mistralai/Mistral-7B-v0.3 \\"
+echo "      --d_causal 64 --epochs 200 --num_samples 50000"
+echo ""
+echo "    # Confounded only (Llama 3.1 8B)"
+echo "    python train_on_transformer.py \\"
+echo "      --domain confounded \\"
+echo "      --model meta-llama/Llama-3.1-8B \\"
 echo "      --d_causal 64 --epochs 200 --num_samples 50000"
 echo ""
 echo "============================================"

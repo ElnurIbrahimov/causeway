@@ -28,20 +28,21 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from causeway.causeway_module import Causeway
-from integration.transformer_bridge import TransformerBridge
-from environments.synthetic_scm import (
-    SyntheticSCM, NUM_VARIABLES, NUM_CONTROLLABLE,
-    CODE_COMPLEXITY, TEST_COVERAGE, DEPLOY_LOAD, ROLLBACK_READINESS,
-)
-from environments.text_scm import state_to_text, action_to_text
+from integration.transformer_bridge import TransformerBridge, TransformerBridgeV2
 
 DIM_NAMES = ["risk_shift", "goal_progress", "constraint_viol", "resource_cost", "success_prob"]
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Closed-loop evaluation: Causeway + GPT-2")
+    p = argparse.ArgumentParser(description="Closed-loop evaluation: Causeway + Transformer")
     p.add_argument("--checkpoint", type=str, default="causeway_gpt2.pt",
                    help="Path to trained Causeway checkpoint")
+    p.add_argument("--domain", type=str, default="deployment",
+                   choices=["deployment", "clinical", "confounded"])
+    p.add_argument("--bridge_checkpoint", type=str, default=None,
+                   help="Path to trained bridge checkpoint (enables trained bridge eval)")
+    p.add_argument("--bridge_version", type=str, default="v2",
+                   choices=["v1", "v2"])
     p.add_argument("--n_scenarios", type=int, default=200,
                    help="Number of test scenarios to generate")
     p.add_argument("--seed", type=int, default=777)
@@ -88,8 +89,8 @@ def delta_to_text(delta_values):
 # Model Loading
 # =====================================================================
 
-def load_models(checkpoint_path, device):
-    """Load frozen Transformer and trained Causeway."""
+def load_models(checkpoint_path, device, bridge_checkpoint_path=None, bridge_version="v2"):
+    """Load frozen Transformer and trained Causeway, optionally with a trained bridge."""
     from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
     # Load checkpoint first to determine which backbone to use
@@ -114,9 +115,11 @@ def load_models(checkpoint_path, device):
 
     print(f"Backbone: {backbone}, d_model={d_model}")
 
+    d_causal = args["d_causal"]
+
     causeway = Causeway(
         d_model=d_model,
-        d_causal=args["d_causal"],
+        d_causal=d_causal,
         d_action=args.get("d_action", d_model),
         graph_layers=args.get("graph_layers", 2),
         propagation_steps=args.get("propagation_steps", 3),
@@ -124,6 +127,7 @@ def load_models(checkpoint_path, device):
     causeway.load_state_dict(ckpt["model_state_dict"])
     causeway.eval()
 
+    # Untrained bridge (always created)
     bridge = TransformerBridge(
         causeway=causeway,
         d_model=d_model,
@@ -131,11 +135,44 @@ def load_models(checkpoint_path, device):
     ).to(device)
     bridge.eval()
 
+    # Trained bridge (optional)
+    bridge_trained = None
+    if bridge_checkpoint_path is not None:
+        print(f"Loading trained bridge from {bridge_checkpoint_path} (version={bridge_version})...")
+        bridge_ckpt = torch.load(bridge_checkpoint_path, map_location=device, weights_only=False)
+        if bridge_version == "v2":
+            bridge_trained = TransformerBridgeV2(
+                causeway=causeway,
+                d_model=d_model,
+                d_causal=d_causal,
+                n_prefix_tokens=4,
+            ).to(device)
+            bridge_trained.prefix_generator.load_state_dict(
+                bridge_ckpt["prefix_generator"])
+            bridge_trained.prefix_positions.data.copy_(
+                bridge_ckpt["prefix_positions"])
+            bridge_trained.norm.load_state_dict(
+                bridge_ckpt["norm"])
+        else:  # v1
+            bridge_trained = TransformerBridge(
+                causeway=causeway,
+                d_model=d_model,
+                n_prefix_tokens=4,
+            ).to(device)
+            bridge_trained.delta_to_prefix.load_state_dict(
+                bridge_ckpt["delta_to_prefix"])
+            bridge_trained.prefix_positions.data.copy_(
+                bridge_ckpt["prefix_positions"])
+            bridge_trained.norm.load_state_dict(
+                bridge_ckpt["norm"])
+        bridge_trained.eval()
+        print(f"Trained bridge loaded successfully.")
+
     n_params = sum(p.numel() for p in causeway.parameters())
     val_corr = ckpt["val_results"]["overall_corr"]
     print(f"Causeway: {n_params / 1e6:.3f}M params, val corr={val_corr:.4f}")
 
-    return tokenizer, encoder, lm_model, causeway, bridge, d_model
+    return tokenizer, encoder, lm_model, causeway, bridge, bridge_trained, d_model
 
 
 def encode_text(text, encoder, tokenizer, device):
@@ -152,11 +189,13 @@ def encode_text(text, encoder, tokenizer, device):
 # Scenario Generation
 # =====================================================================
 
-def generate_scenarios(scm, n, seed):
-    """Generate deployment scenarios with paired safe/risky actions.
+def generate_scenarios(scm, n, seed, domain="deployment",
+                       state_to_text_fn=None, action_to_text_fn=None,
+                       NUM_VARIABLES_D=8, NUM_CONTROLLABLE_D=4):
+    """Generate paired safe/risky scenarios for any domain.
 
-    Each pair is verified against SCM ground truth: the safe action
-    must have a clearly higher quality score than the risky action.
+    Each pair is verified against SCM ground truth: the better action
+    must have a clearly higher quality score than the worse action.
     """
     rng = np.random.RandomState(seed)
     scenarios = []
@@ -166,54 +205,150 @@ def generate_scenarios(scm, n, seed):
         attempts += 1
         state = scm.sample_state(1)
 
-        action_type = rng.choice(["coverage", "load", "rollback", "multi"])
-        safe_mask = np.zeros((1, NUM_VARIABLES))
-        safe_vals = np.zeros((1, NUM_VARIABLES))
-        risky_mask = np.zeros((1, NUM_VARIABLES))
-        risky_vals = np.zeros((1, NUM_VARIABLES))
+        if domain == "deployment":
+            from environments.synthetic_scm import (
+                TEST_COVERAGE, DEPLOY_LOAD, ROLLBACK_READINESS,
+            )
+            action_type = rng.choice(["coverage", "load", "rollback", "multi"])
+            safe_mask = np.zeros((1, NUM_VARIABLES_D))
+            safe_vals = np.zeros((1, NUM_VARIABLES_D))
+            risky_mask = np.zeros((1, NUM_VARIABLES_D))
+            risky_vals = np.zeros((1, NUM_VARIABLES_D))
 
-        if action_type == "coverage":
-            # Safe: increase test coverage. Risky: decrease it.
-            safe_mask[0, TEST_COVERAGE] = 1.0
-            safe_vals[0, TEST_COVERAGE] = min(
-                state[0, TEST_COVERAGE] + rng.uniform(0.15, 0.4), 1.0)
-            risky_mask[0, TEST_COVERAGE] = 1.0
-            risky_vals[0, TEST_COVERAGE] = max(
-                state[0, TEST_COVERAGE] - rng.uniform(0.15, 0.4), 0.0)
+            if action_type == "coverage":
+                safe_mask[0, TEST_COVERAGE] = 1.0
+                safe_vals[0, TEST_COVERAGE] = min(
+                    state[0, TEST_COVERAGE] + rng.uniform(0.15, 0.4), 1.0)
+                risky_mask[0, TEST_COVERAGE] = 1.0
+                risky_vals[0, TEST_COVERAGE] = max(
+                    state[0, TEST_COVERAGE] - rng.uniform(0.15, 0.4), 0.0)
+            elif action_type == "load":
+                safe_mask[0, DEPLOY_LOAD] = 1.0
+                safe_vals[0, DEPLOY_LOAD] = max(
+                    state[0, DEPLOY_LOAD] - rng.uniform(0.15, 0.4), 0.0)
+                risky_mask[0, DEPLOY_LOAD] = 1.0
+                risky_vals[0, DEPLOY_LOAD] = min(
+                    state[0, DEPLOY_LOAD] + rng.uniform(0.15, 0.4), 1.0)
+            elif action_type == "rollback":
+                safe_mask[0, ROLLBACK_READINESS] = 1.0
+                safe_vals[0, ROLLBACK_READINESS] = min(
+                    state[0, ROLLBACK_READINESS] + rng.uniform(0.15, 0.4), 1.0)
+                risky_mask[0, ROLLBACK_READINESS] = 1.0
+                risky_vals[0, ROLLBACK_READINESS] = max(
+                    state[0, ROLLBACK_READINESS] - rng.uniform(0.15, 0.4), 0.0)
+            else:  # multi: coverage + load combined
+                safe_mask[0, TEST_COVERAGE] = 1.0
+                safe_mask[0, DEPLOY_LOAD] = 1.0
+                safe_vals[0, TEST_COVERAGE] = min(
+                    state[0, TEST_COVERAGE] + rng.uniform(0.1, 0.3), 1.0)
+                safe_vals[0, DEPLOY_LOAD] = max(
+                    state[0, DEPLOY_LOAD] - rng.uniform(0.1, 0.3), 0.0)
+                risky_mask[0, TEST_COVERAGE] = 1.0
+                risky_mask[0, DEPLOY_LOAD] = 1.0
+                risky_vals[0, TEST_COVERAGE] = max(
+                    state[0, TEST_COVERAGE] - rng.uniform(0.1, 0.3), 0.0)
+                risky_vals[0, DEPLOY_LOAD] = min(
+                    state[0, DEPLOY_LOAD] + rng.uniform(0.1, 0.3), 1.0)
 
-        elif action_type == "load":
-            # Safe: decrease deploy load. Risky: increase it.
-            safe_mask[0, DEPLOY_LOAD] = 1.0
-            safe_vals[0, DEPLOY_LOAD] = max(
-                state[0, DEPLOY_LOAD] - rng.uniform(0.15, 0.4), 0.0)
-            risky_mask[0, DEPLOY_LOAD] = 1.0
-            risky_vals[0, DEPLOY_LOAD] = min(
-                state[0, DEPLOY_LOAD] + rng.uniform(0.15, 0.4), 1.0)
+        elif domain == "clinical":
+            from environments.clinical_scm import (
+                DRUG_DOSAGE, TREATMENT_INTENSITY,
+                MONITORING_FREQUENCY, ACTIVITY_RESTRICTION,
+            )
+            action_type = rng.choice(["dosage", "intensity", "monitoring", "multi"])
+            safe_mask = np.zeros((1, NUM_VARIABLES_D))
+            safe_vals = np.zeros((1, NUM_VARIABLES_D))
+            risky_mask = np.zeros((1, NUM_VARIABLES_D))
+            risky_vals = np.zeros((1, NUM_VARIABLES_D))
 
-        elif action_type == "rollback":
-            # Safe: increase rollback readiness. Risky: decrease it.
-            safe_mask[0, ROLLBACK_READINESS] = 1.0
-            safe_vals[0, ROLLBACK_READINESS] = min(
-                state[0, ROLLBACK_READINESS] + rng.uniform(0.15, 0.4), 1.0)
-            risky_mask[0, ROLLBACK_READINESS] = 1.0
-            risky_vals[0, ROLLBACK_READINESS] = max(
-                state[0, ROLLBACK_READINESS] - rng.uniform(0.15, 0.4), 0.0)
+            if action_type == "dosage":
+                # Safe: decrease drug dosage. Risky: increase it.
+                safe_mask[0, DRUG_DOSAGE] = 1.0
+                safe_vals[0, DRUG_DOSAGE] = max(
+                    state[0, DRUG_DOSAGE] - rng.uniform(0.15, 0.4), 0.0)
+                risky_mask[0, DRUG_DOSAGE] = 1.0
+                risky_vals[0, DRUG_DOSAGE] = min(
+                    state[0, DRUG_DOSAGE] + rng.uniform(0.15, 0.4), 1.0)
+            elif action_type == "intensity":
+                # Safe: decrease treatment intensity. Risky: increase it.
+                safe_mask[0, TREATMENT_INTENSITY] = 1.0
+                safe_vals[0, TREATMENT_INTENSITY] = max(
+                    state[0, TREATMENT_INTENSITY] - rng.uniform(0.15, 0.4), 0.0)
+                risky_mask[0, TREATMENT_INTENSITY] = 1.0
+                risky_vals[0, TREATMENT_INTENSITY] = min(
+                    state[0, TREATMENT_INTENSITY] + rng.uniform(0.15, 0.4), 1.0)
+            elif action_type == "monitoring":
+                # Safe: increase monitoring. Risky: decrease it.
+                safe_mask[0, MONITORING_FREQUENCY] = 1.0
+                safe_vals[0, MONITORING_FREQUENCY] = min(
+                    state[0, MONITORING_FREQUENCY] + rng.uniform(0.15, 0.4), 1.0)
+                risky_mask[0, MONITORING_FREQUENCY] = 1.0
+                risky_vals[0, MONITORING_FREQUENCY] = max(
+                    state[0, MONITORING_FREQUENCY] - rng.uniform(0.15, 0.4), 0.0)
+            else:  # multi: dosage + monitoring combined
+                safe_mask[0, DRUG_DOSAGE] = 1.0
+                safe_mask[0, MONITORING_FREQUENCY] = 1.0
+                safe_vals[0, DRUG_DOSAGE] = max(
+                    state[0, DRUG_DOSAGE] - rng.uniform(0.1, 0.3), 0.0)
+                safe_vals[0, MONITORING_FREQUENCY] = min(
+                    state[0, MONITORING_FREQUENCY] + rng.uniform(0.1, 0.3), 1.0)
+                risky_mask[0, DRUG_DOSAGE] = 1.0
+                risky_mask[0, MONITORING_FREQUENCY] = 1.0
+                risky_vals[0, DRUG_DOSAGE] = min(
+                    state[0, DRUG_DOSAGE] + rng.uniform(0.1, 0.3), 1.0)
+                risky_vals[0, MONITORING_FREQUENCY] = max(
+                    state[0, MONITORING_FREQUENCY] - rng.uniform(0.1, 0.3), 0.0)
 
-        else:  # multi: coverage + load combined
-            safe_mask[0, TEST_COVERAGE] = 1.0
-            safe_mask[0, DEPLOY_LOAD] = 1.0
-            safe_vals[0, TEST_COVERAGE] = min(
-                state[0, TEST_COVERAGE] + rng.uniform(0.1, 0.3), 1.0)
-            safe_vals[0, DEPLOY_LOAD] = max(
-                state[0, DEPLOY_LOAD] - rng.uniform(0.1, 0.3), 0.0)
-            risky_mask[0, TEST_COVERAGE] = 1.0
-            risky_mask[0, DEPLOY_LOAD] = 1.0
-            risky_vals[0, TEST_COVERAGE] = max(
-                state[0, TEST_COVERAGE] - rng.uniform(0.1, 0.3), 0.0)
-            risky_vals[0, DEPLOY_LOAD] = min(
-                state[0, DEPLOY_LOAD] + rng.uniform(0.1, 0.3), 1.0)
+        elif domain == "confounded":
+            # Neutral variable interventions — pick a random controllable
+            # and create increase/decrease pair
+            var_idx = rng.choice(NUM_CONTROLLABLE_D)
+            mask1 = np.zeros((1, NUM_VARIABLES_D))
+            vals1 = np.zeros((1, NUM_VARIABLES_D))
+            mask2 = np.zeros((1, NUM_VARIABLES_D))
+            vals2 = np.zeros((1, NUM_VARIABLES_D))
 
-        # Compute SCM ground-truth deltas
+            # Action 1: increase the variable
+            mask1[0, var_idx] = 1.0
+            vals1[0, var_idx] = min(state[0, var_idx] + rng.uniform(0.15, 0.4), 1.0)
+            # Action 2: decrease the variable
+            mask2[0, var_idx] = 1.0
+            vals2[0, var_idx] = max(state[0, var_idx] - rng.uniform(0.15, 0.4), 0.0)
+
+            # Compute ground-truth deltas for both
+            _, raw1 = scm.intervene(state, mask1, vals1)
+            _, raw2 = scm.intervene(state, mask2, vals2)
+            delta1 = scm.compute_structured_delta(raw1)[0]
+            delta2 = scm.compute_structured_delta(raw2)[0]
+            q1 = quality_score(delta1)
+            q2 = quality_score(delta2)
+
+            # Keep whichever has higher quality as "safe", lower as "risky"
+            if q1 > q2 + 0.05:
+                safe_mask, safe_vals = mask1, vals1
+                risky_mask, risky_vals = mask2, vals2
+                safe_delta, risky_delta = delta1, delta2
+            elif q2 > q1 + 0.05:
+                safe_mask, safe_vals = mask2, vals2
+                risky_mask, risky_vals = mask1, vals1
+                safe_delta, risky_delta = delta2, delta1
+            else:
+                continue  # not enough separation
+
+            idx = len(scenarios)
+            scenarios.append({
+                "state": state,
+                "state_text": state_to_text_fn(state[0], idx % 4),
+                "safe_text": action_to_text_fn(safe_mask[0], safe_vals[0], idx % 4),
+                "risky_text": action_to_text_fn(risky_mask[0], risky_vals[0], idx % 4),
+                "safe_delta_gt": safe_delta,
+                "risky_delta_gt": risky_delta,
+                "safe_quality_gt": quality_score(safe_delta),
+                "risky_quality_gt": quality_score(risky_delta),
+            })
+            continue  # already appended, skip common path below
+
+        # Compute SCM ground-truth deltas (deployment / clinical paths)
         _, safe_raw = scm.intervene(state, safe_mask, safe_vals)
         _, risky_raw = scm.intervene(state, risky_mask, risky_vals)
         safe_delta = scm.compute_structured_delta(safe_raw)[0]
@@ -226,9 +361,9 @@ def generate_scenarios(scm, n, seed):
         idx = len(scenarios)
         scenarios.append({
             "state": state,
-            "state_text": state_to_text(state[0], idx % 4),
-            "safe_text": action_to_text(safe_mask[0], safe_vals[0], idx % 4),
-            "risky_text": action_to_text(risky_mask[0], risky_vals[0], idx % 4),
+            "state_text": state_to_text_fn(state[0], idx % 4),
+            "safe_text": action_to_text_fn(safe_mask[0], safe_vals[0], idx % 4),
+            "risky_text": action_to_text_fn(risky_mask[0], risky_vals[0], idx % 4),
             "safe_delta_gt": safe_delta,
             "risky_delta_gt": risky_delta,
             "safe_quality_gt": quality_score(safe_delta),
@@ -420,17 +555,28 @@ def test_risk_probe(scenarios, encoder, lm_model, tokenizer, causeway, device):
 # TEST 4: Pairwise Selection
 # =====================================================================
 
-def test_pairwise_selection(scenarios, encoder, lm_model, tokenizer, causeway, bridge, device):
-    """Given two actions, does GPT-2 pick the safer one with Causeway's help?"""
+def test_pairwise_selection(scenarios, encoder, lm_model, tokenizer, causeway,
+                            bridge, device, domain="deployment",
+                            bridge_trained=None):
+    """Given two actions, does the Transformer pick the safer one with Causeway's help?"""
     section("TEST 4: Pairwise Selection")
 
     token_A = tokenizer.encode(" A")[0]
     token_B = tokenizer.encode(" B")[0]
 
+    # Domain-appropriate prompt suffix
+    if domain == "deployment":
+        safer_prompt_suffix = "The safer deployment option is Option"
+    elif domain == "clinical":
+        safer_prompt_suffix = "The safer treatment option is Option"
+    else:  # confounded
+        safer_prompt_suffix = "The better option is Option"
+
     rng = np.random.RandomState(42)
     baseline_correct = 0
     text_correct = 0
     prefix_correct = 0
+    trained_prefix_correct = 0
     total = 0
 
     for sc in tqdm(scenarios, desc="Pairwise selection"):
@@ -456,7 +602,7 @@ def test_pairwise_selection(scenarios, encoder, lm_model, tokenizer, causeway, b
             f"{sc['state_text']} "
             f"Option A: {opt_a_text} "
             f"Option B: {opt_b_text} "
-            f"The safer deployment option is Option"
+            f"{safer_prompt_suffix}"
         )
 
         # Augmented prompt (Causeway analysis for both options)
@@ -468,10 +614,10 @@ def test_pairwise_selection(scenarios, encoder, lm_model, tokenizer, causeway, b
             f"{sc['state_text']} "
             f"Option A: {opt_a_text} "
             f"Option B: {opt_b_text} "
-            f"The safer deployment option is Option"
+            f"{safer_prompt_suffix}"
         )
 
-        # === Baseline: GPT-2 alone ===
+        # === Baseline: Transformer alone ===
         inputs = tokenizer(
             base_prompt, return_tensors="pt", truncation=True, max_length=300
         ).to(device)
@@ -481,7 +627,7 @@ def test_pairwise_selection(scenarios, encoder, lm_model, tokenizer, causeway, b
         if choice == correct_token:
             baseline_correct += 1
 
-        # === Text injection: GPT-2 + Causeway analysis as text ===
+        # === Text injection: Transformer + Causeway analysis as text ===
         inputs_aug = tokenizer(
             aug_prompt, return_tensors="pt", truncation=True, max_length=400
         ).to(device)
@@ -491,19 +637,18 @@ def test_pairwise_selection(scenarios, encoder, lm_model, tokenizer, causeway, b
         if choice == correct_token:
             text_correct += 1
 
-        # === Prefix injection: GPT-2 + TransformerBridge (untrained) ===
-        # Inject prefix from the Causeway-preferred action
+        # === Prefix injection: Transformer + TransformerBridge (untrained) ===
         q_a = quality_score(delta_a)
         q_b = quality_score(delta_b)
         best_action_repr = a_a if q_a > q_b else a_b
         prefix = bridge.get_causal_prefix(h, best_action_repr)
 
-        # Get input embeddings (works for both GPT-2 and Mistral/Llama)
+        # Get input embeddings (works for GPT-2, Mistral, and Llama)
         if hasattr(lm_model, 'transformer'):
             input_embeds = lm_model.transformer.wte(inputs.input_ids)
         else:
             input_embeds = lm_model.model.embed_tokens(inputs.input_ids)
-        # Match dtypes (bridge outputs fp32, Mistral expects fp16)
+        # Match dtypes (bridge outputs fp32, Mistral/Llama may expect fp16)
         prefix = prefix.to(input_embeds.dtype)
         augmented_embeds = torch.cat([prefix, input_embeds], dim=1)
         aug_mask = torch.ones(1, augmented_embeds.shape[1], device=device)
@@ -519,6 +664,24 @@ def test_pairwise_selection(scenarios, encoder, lm_model, tokenizer, causeway, b
         if choice == correct_token:
             prefix_correct += 1
 
+        # === Prefix injection: Transformer + Bridge (TRAINED) ===
+        if bridge_trained is not None:
+            trained_prefix = bridge_trained.get_causal_prefix(h, best_action_repr)
+            trained_prefix = trained_prefix.to(input_embeds.dtype)
+            trained_embeds = torch.cat([trained_prefix, input_embeds], dim=1)
+            trained_mask = torch.ones(1, trained_embeds.shape[1], device=device)
+            trained_pos_ids = torch.arange(trained_embeds.shape[1], device=device).unsqueeze(0)
+
+            with torch.no_grad():
+                logits_trained = lm_model(
+                    inputs_embeds=trained_embeds,
+                    attention_mask=trained_mask,
+                    position_ids=trained_pos_ids,
+                ).logits[0, -1, :]
+            choice = token_A if logits_trained[token_A] > logits_trained[token_B] else token_B
+            if choice == correct_token:
+                trained_prefix_correct += 1
+
         total += 1
 
     base_acc = baseline_correct / total
@@ -527,14 +690,22 @@ def test_pairwise_selection(scenarios, encoder, lm_model, tokenizer, causeway, b
 
     print(f"\n  {'Method':<32} {'Selection Accuracy':>20}")
     print(f"  {'-'*54}")
-    print(f"  {'Baseline (GPT-2)':<32} {base_acc*100:>19.1f}%")
+    print(f"  {'Baseline (Transformer)':<32} {base_acc*100:>19.1f}%")
     print(f"  {'+ Causeway text injection':<32} {text_acc*100:>19.1f}%")
     print(f"  {'+ Bridge prefix (untrained)':<32} {prefix_acc*100:>19.1f}%")
+
+    trained_prefix_acc = None
+    if bridge_trained is not None:
+        trained_prefix_acc = trained_prefix_correct / total
+        print(f"  {'+ Bridge prefix (trained)':<32} {trained_prefix_acc*100:>19.1f}%")
+
     print(f"  {'-'*54}")
     print(f"  {'Text lift vs baseline':<32} {(text_acc - base_acc)*100:>+19.1f}%")
     print(f"  {'Prefix lift vs baseline':<32} {(prefix_acc - base_acc)*100:>+19.1f}%")
+    if trained_prefix_acc is not None:
+        print(f"  {'Trained prefix lift':<32} {(trained_prefix_acc - base_acc)*100:>+19.1f}%")
 
-    return base_acc, text_acc, prefix_acc
+    return base_acc, text_acc, prefix_acc, trained_prefix_acc
 
 
 # =====================================================================
@@ -546,20 +717,47 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
 
+    # Dynamic imports based on domain
+    if args.domain == "confounded":
+        from environments.confounded_scm import (
+            ConfoundedSCM as SCMClass, NUM_VARIABLES as NV, NUM_CONTROLLABLE as NC,
+        )
+        from environments.text_confounded import state_to_text, action_to_text
+    elif args.domain == "clinical":
+        from environments.clinical_scm import (
+            ClinicalSCM as SCMClass, NUM_VARIABLES as NV, NUM_CONTROLLABLE as NC,
+        )
+        from environments.text_clinical import state_to_text, action_to_text
+    else:
+        from environments.synthetic_scm import (
+            SyntheticSCM as SCMClass, NUM_VARIABLES as NV, NUM_CONTROLLABLE as NC,
+        )
+        from environments.text_scm import state_to_text, action_to_text
+
     print(f"{'='*70}")
-    print(f"  CLOSED-LOOP EVALUATION: Causeway + GPT-2")
+    print(f"  CLOSED-LOOP EVALUATION: Causeway + Transformer")
+    print(f"  Domain: {args.domain}")
     print(f"{'='*70}")
     print(f"Device: {device}")
 
     # Load models
-    tokenizer, encoder, lm_model, causeway, bridge, d_model = load_models(
-        args.checkpoint, device
+    tokenizer, encoder, lm_model, causeway, bridge, bridge_trained, d_model = load_models(
+        args.checkpoint, device,
+        bridge_checkpoint_path=args.bridge_checkpoint,
+        bridge_version=args.bridge_version,
     )
 
     # Generate test scenarios
-    print(f"\nGenerating {args.n_scenarios} test scenarios...")
-    scm = SyntheticSCM(noise_scale=0.05, seed=42)
-    scenarios = generate_scenarios(scm, args.n_scenarios, args.seed)
+    print(f"\nGenerating {args.n_scenarios} test scenarios (domain={args.domain})...")
+    scm = SCMClass(noise_scale=0.05, seed=42)
+    scenarios = generate_scenarios(
+        scm, args.n_scenarios, args.seed,
+        domain=args.domain,
+        state_to_text_fn=state_to_text,
+        action_to_text_fn=action_to_text,
+        NUM_VARIABLES_D=NV,
+        NUM_CONTROLLABLE_D=NC,
+    )
 
     # Run tests
     all_pred, all_gt, delta_corr = test_delta_accuracy(
@@ -574,32 +772,39 @@ def main():
         scenarios, encoder, lm_model, tokenizer, causeway, device
     )
 
-    base_sel, text_sel, prefix_sel = test_pairwise_selection(
-        scenarios, encoder, lm_model, tokenizer, causeway, bridge, device
+    base_sel, text_sel, prefix_sel, trained_sel = test_pairwise_selection(
+        scenarios, encoder, lm_model, tokenizer, causeway, bridge, device,
+        domain=args.domain,
+        bridge_trained=bridge_trained,
     )
 
     # Summary
     section("SUMMARY")
+    print(f"\n  Domain: {args.domain}")
     print(f"""
   Causeway delta accuracy:     {delta_corr:.4f} correlation with ground truth
   Causeway action ranking:     {rank_acc*100:.1f}% correct (safe > risky)
   Quality gap correlation:     {gap_corr:.4f}
 
   Risk probe:
-    GPT-2 baseline:            corr={base_risk_corr:.4f}, acc={base_risk_acc*100:.1f}%
+    Baseline:                  corr={base_risk_corr:.4f}, acc={base_risk_acc*100:.1f}%
     + Causeway text:           corr={aug_risk_corr:.4f}, acc={aug_risk_acc*100:.1f}%
     Lift:                      {(aug_risk_corr - base_risk_corr):+.4f} corr, {(aug_risk_acc - base_risk_acc)*100:+.1f}% acc
 
   Pairwise selection:
-    GPT-2 baseline:            {base_sel*100:.1f}%
+    Baseline:                  {base_sel*100:.1f}%
     + Causeway text:           {text_sel*100:.1f}% ({(text_sel - base_sel)*100:+.1f}%)
-    + Bridge prefix:           {prefix_sel*100:.1f}% ({(prefix_sel - base_sel)*100:+.1f}%)
-""")
+    + Bridge prefix:           {prefix_sel*100:.1f}% ({(prefix_sel - base_sel)*100:+.1f}%)""")
+
+    if trained_sel is not None:
+        print(f"    + Bridge prefix (trained): {trained_sel*100:.1f}% ({(trained_sel - base_sel)*100:+.1f}%)")
+
+    print()
 
     # Interpretation
     if text_sel > base_sel + 0.05:
         print("  >>> The closed loop works. Causeway's causal deltas, injected as text,")
-        print("  >>> improve GPT-2's deployment decisions against SCM ground truth.")
+        print(f"  >>> improve the Transformer's {args.domain} decisions against SCM ground truth.")
     elif text_sel > base_sel:
         print("  >>> Marginal improvement. The signal helps but the effect is small.")
     else:
@@ -610,6 +815,11 @@ def main():
         print("  >>> Next step: train the bridge on labeled decision data.")
     elif prefix_sel > base_sel + 0.05:
         print("  >>> Bridge prefix works even untrained — the delta signal is strong.")
+
+    if trained_sel is not None and trained_sel > prefix_sel + 0.02:
+        print("  >>> Trained bridge improves over untrained — bridge training is effective.")
+    elif trained_sel is not None and trained_sel > base_sel + 0.05:
+        print("  >>> Trained bridge beats baseline — causal steering works.")
 
     print(f"\n{'='*70}")
 

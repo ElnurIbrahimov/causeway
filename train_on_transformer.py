@@ -38,8 +38,8 @@ from causeway.losses import CausewayLoss
 def parse_args():
     p = argparse.ArgumentParser(description="Train Causeway on Transformer")
     p.add_argument("--domain", type=str, default="deployment",
-                   choices=["deployment", "clinical"],
-                   help="SCM domain: deployment (software) or clinical (treatment)")
+                   choices=["deployment", "clinical", "confounded"],
+                   help="SCM domain: deployment (software), clinical (treatment), or confounded (neutral causal)")
     p.add_argument("--model", type=str, default="gpt2",
                    help="HuggingFace model name (gpt2, TinyLlama/TinyLlama-1.1B-Chat-v1.0, etc)")
     p.add_argument("--d_causal", type=int, default=48)
@@ -134,6 +134,8 @@ def main():
     # Domain-aware imports and cache paths
     if args.domain == "clinical":
         from environments.text_clinical import TextClinicalDataset as DatasetClass
+    elif args.domain == "confounded":
+        from environments.text_confounded import TextConfoundedDataset as DatasetClass
     else:
         from environments.text_scm import TextSCMDataset as DatasetClass
 

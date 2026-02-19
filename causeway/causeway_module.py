@@ -131,6 +131,30 @@ class Causeway(nn.Module):
 
         return delta
 
+    def forward_with_internals(self, h: torch.Tensor, action: torch.Tensor) -> Dict:
+        """Forward pass returning delta AND internal causal representations.
+
+        Returns dict with:
+            - 'delta': DeltaVector (same as forward())
+            - 'z_refined': (batch, d_causal) refined causal state
+            - 'z_counterfactual': (batch, d_causal) counterfactual state
+            - 'intervention_mask': (batch, d_causal) soft intervention mask
+        """
+        z = self.state_encoder(h)
+        z_refined = self.causal_graph(z)
+        adjacency = self.causal_graph.adjacency
+        z_counterfactual, mask, epsilon = self.intervention_engine(
+            z_refined, action, adjacency,
+            num_propagation_steps=self.propagation_steps,
+        )
+        delta = self.delta_predictor(z_refined, z_counterfactual)
+        return {
+            'delta': delta,
+            'z_refined': z_refined,
+            'z_counterfactual': z_counterfactual,
+            'intervention_mask': mask,
+        }
+
     def get_diagnostics(self) -> Dict:
         """Return diagnostic info about the module's internal state."""
         graph_stats = self.causal_graph.get_graph_stats()

@@ -152,3 +152,129 @@ class TransformerBridge(nn.Module):
         """
         prefix = self.get_causal_prefix(h, action)
         return torch.cat([prefix, input_embeddings], dim=1)
+
+
+class TransformerBridgeV2(nn.Module):
+    """
+    V2 Bridge: Uses full causal representations, not just the 10-dim delta summary.
+
+    Input to prefix generator:
+        cat([z_refined, z_counterfactual, delta.values, delta.confidence])
+        = 2 * d_causal + 2 * n_delta_dims
+
+    This gives the bridge access to the full learned causal state, not just
+    the projected summary. The bridge can learn which causal variables matter
+    for steering the Transformer.
+    """
+
+    def __init__(
+        self,
+        causeway: Causeway,
+        d_model: int,
+        d_causal: int,
+        n_prefix_tokens: int = 4,
+        n_delta_dims: int = 5,
+    ):
+        super().__init__()
+        self.causeway = causeway
+        self.d_model = d_model
+        self.d_causal = d_causal
+        self.n_prefix_tokens = n_prefix_tokens
+
+        # Full causal state as input: z_refined + z_counterfactual + delta + confidence
+        input_dim = 2 * d_causal + 2 * n_delta_dims
+
+        self.prefix_generator = nn.Sequential(
+            nn.Linear(input_dim, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, n_prefix_tokens * d_model),
+        )
+
+        # Learned positional embeddings for prefix tokens
+        self.prefix_positions = nn.Parameter(
+            torch.randn(1, n_prefix_tokens, d_model) * 0.02
+        )
+
+        # LayerNorm to match Transformer's expected input distribution
+        self.norm = nn.LayerNorm(d_model)
+
+    def get_delta(self, h: torch.Tensor, action: torch.Tensor) -> DeltaVector:
+        """Run Causeway and return the raw delta vector."""
+        return self.causeway(h, action)
+
+    def get_causal_prefix(
+        self,
+        h: torch.Tensor,
+        action: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Generate causal prefix tokens using full causal representations.
+
+        Args:
+            h: Transformer hidden state, shape (batch, d_model).
+            action: Action representation, shape (batch, d_action).
+
+        Returns:
+            prefix: shape (batch, n_prefix_tokens, d_model).
+        """
+        batch_size = h.shape[0]
+
+        # Get full internals from Causeway
+        internals = self.causeway.forward_with_internals(h, action)
+        delta = internals['delta']
+        z_refined = internals['z_refined']
+        z_counterfactual = internals['z_counterfactual']
+
+        # Build wide input: full causal state + delta summary
+        bridge_input = torch.cat([
+            z_refined,
+            z_counterfactual,
+            delta.values,
+            delta.confidence,
+        ], dim=-1)
+
+        # Generate prefix tokens
+        prefix_flat = self.prefix_generator(bridge_input)
+        prefix = prefix_flat.view(batch_size, self.n_prefix_tokens, self.d_model)
+
+        # Add positional info and normalize
+        prefix = prefix + self.prefix_positions
+        prefix = self.norm(prefix)
+
+        return prefix
+
+    def get_causal_prefix_from_internals(
+        self,
+        z_refined: torch.Tensor,
+        z_counterfactual: torch.Tensor,
+        delta: DeltaVector,
+    ) -> torch.Tensor:
+        """
+        Generate prefix from pre-computed Causeway internals.
+        Useful when you've already run Causeway and want to avoid re-computation.
+        """
+        batch_size = z_refined.shape[0]
+
+        bridge_input = torch.cat([
+            z_refined,
+            z_counterfactual,
+            delta.values,
+            delta.confidence,
+        ], dim=-1)
+
+        prefix_flat = self.prefix_generator(bridge_input)
+        prefix = prefix_flat.view(batch_size, self.n_prefix_tokens, self.d_model)
+        prefix = prefix + self.prefix_positions
+        prefix = self.norm(prefix)
+
+        return prefix
+
+    def forward(
+        self,
+        input_embeddings: torch.Tensor,
+        h: torch.Tensor,
+        action: torch.Tensor,
+    ) -> torch.Tensor:
+        """Prepend causal prefix to input embeddings."""
+        prefix = self.get_causal_prefix(h, action)
+        return torch.cat([prefix, input_embeddings], dim=1)
