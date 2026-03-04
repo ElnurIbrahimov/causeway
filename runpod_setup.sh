@@ -84,7 +84,11 @@ print('All checks passed!')
 
 echo ""
 echo "============================================"
-echo "  Setup complete! Start training with:"
+echo "  Setup complete! Run ablation suite (recommended first step):"
+echo ""
+echo "    chmod +x run_ablations.sh && ./run_ablations.sh"
+echo ""
+echo "  Or run Mistral pipeline directly:"
 echo ""
 echo "    chmod +x run_mistral.sh && ./run_mistral.sh"
 echo ""
