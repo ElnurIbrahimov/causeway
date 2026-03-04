@@ -181,9 +181,11 @@ def run_variant(name, model, criterion, train_loader, val_loader, device,
             h, action, target = h.to(device), action.to(device), target.to(device)
             delta = model(h, action)
             reg = model.get_regularization_losses()
-            # Pass graph for min connectivity loss
-            losses = criterion(delta, target, reg,
-                               causal_graph=model.causal_graph if hasattr(criterion, 'min_edges') else None)
+            # Pass graph for min connectivity loss (only GraphFixLoss supports this)
+            if hasattr(criterion, 'min_edges'):
+                losses = criterion(delta, target, reg, causal_graph=model.causal_graph)
+            else:
+                losses = criterion(delta, target, reg)
             optimizer.zero_grad()
             losses["total"].backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
