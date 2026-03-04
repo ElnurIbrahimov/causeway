@@ -45,7 +45,7 @@ class CausalGraphLayer(nn.Module):
         num_layers: int = 2,
         dropout: float = 0.1,
         initial_temperature: float = 1.0,
-        edge_prior: float = -2.0,
+        edge_prior: float = 0.0,
     ):
         """
         Args:
@@ -60,7 +60,7 @@ class CausalGraphLayer(nn.Module):
         self.num_layers = num_layers
 
         # Raw adjacency weights (edge strengths)
-        self.W_raw = nn.Parameter(torch.randn(d_causal, d_causal) * 0.01)
+        self.W_raw = nn.Parameter(torch.randn(d_causal, d_causal) * 0.1)
 
         # Edge gate logits — initialized negative to bias toward sparsity
         # α_ij: probability of edge i→j existing = σ(α_ij)
@@ -156,7 +156,7 @@ class CausalGraphLayer(nn.Module):
             messages = h @ W  # (batch, d_causal)
             messages = self.edge_mlps[i](messages)
             messages = messages * self.scales[i] + self.biases[i]
-            h = h + self.dropout(F.gelu(messages))
+            h = self.dropout(F.gelu(messages))
 
         return self.norm(h)
 
