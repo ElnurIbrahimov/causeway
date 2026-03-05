@@ -7,3 +7,5 @@ transformers>=4.36.0
 accelerate>=0.25.0
 sentencepiece>=0.1.99
 protobuf>=4.25.0
+causal-conv1d>=1.4.0
+mamba-ssm>=2.2.2
